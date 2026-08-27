@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import io
@@ -10,292 +9,166 @@ st.set_page_config(page_title="حاسبة واصل المخزن", page_icon="�
 
 st.markdown("""
 <style>
-.block-container {max-width: 1200px; padding-top: 1.3rem;}
-h1 {text-align:center;}
-.stButton button {width:100%; font-weight:700;}
-div[data-testid="stMetricValue"] {font-size:1.45rem;}
+.block-container{max-width:1100px;padding-top:1rem}
+h1{text-align:center}
+.stButton>button,.stDownloadButton>button{width:100%;font-weight:700}
 </style>
 """, unsafe_allow_html=True)
 
 st.title("📦 حاسبة سعر البضاعة واصل المخزن")
-st.caption("ارفع الفاتورة، أدخل تكلفة النقل، واختر طريقة توزيع النقل.")
+st.write("ارفع الفاتورة، راجع البيانات، أدخل النقل، ثم احسب السعر واصل المخزن.")
 
-def clean_number(x):
-    if pd.isna(x):
-        return None
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x).strip().replace(",", "")
-    s = re.sub(r"[^0-9.\-]", "", s)
-    try:
-        return float(s) if s else None
-    except:
-        return None
+def num(x):
+    if pd.isna(x): return None
+    if isinstance(x,(int,float)): return float(x)
+    s=re.sub(r"[^0-9.\-]","",str(x).replace(",",""))
+    try:return float(s) if s else None
+    except:return None
 
-def normalize_columns(df):
-    df = df.copy()
-    mapping = {}
+def normalize(df):
+    df=df.copy()
+    rename={}
     for c in df.columns:
-        s = str(c).strip().lower()
-        if any(k in s for k in ["item", "description", "product", "الصنف", "الوصف", "name"]):
-            mapping[c] = "الصنف"
-        elif any(k in s for k in ["qty", "quantity", "pcs", "الكمية", "عدد"]):
-            mapping[c] = "الكمية"
-        elif any(k in s for k in ["unit price", "price", "السعر", "سعر الوحدة"]):
-            mapping[c] = "سعر الوحدة"
-        elif any(k in s for k in ["weight", "kg", "الوزن"]):
-            mapping[c] = "الوزن"
-        elif any(k in s for k in ["amount", "total", "value", "المجموع", "القيمة"]):
-            mapping[c] = "القيمة"
-    df = df.rename(columns=mapping)
+        s=str(c).strip().lower()
+        if any(k in s for k in ["description","product","item","الصنف","الوصف","name"]): rename[c]="الصنف"
+        elif any(k in s for k in ["quantity","qty","pcs","الكمية","عدد"]): rename[c]="الكمية"
+        elif any(k in s for k in ["unit price","unitprice","price","سعر الوحدة","السعر"]): rename[c]="سعر الوحدة"
+        elif any(k in s for k in ["weight","gross weight","net weight","kg","الوزن"]): rename[c]="الوزن"
+        elif any(k in s for k in ["amount","total value","line total","value","القيمة","المجموع"]): rename[c]="القيمة"
+    df=df.rename(columns=rename)
+    # Handle duplicate mapped columns
+    df=df.loc[:,~df.columns.duplicated()]
+    for c in ["الصنف","الكمية","سعر الوحدة","الوزن","القيمة"]:
+        if c not in df.columns: df[c]="" if c=="الصنف" else None
+    df=df[["الصنف","الكمية","سعر الوحدة","الوزن","القيمة"]]
+    df["الصنف"]=df["الصنف"].fillna("").astype(str)
+    for c in ["الكمية","سعر الوحدة","الوزن","القيمة"]:
+        df[c]=df[c].apply(num)
+    m=df["القيمة"].isna() & df["الكمية"].notna() & df["سعر الوحدة"].notna()
+    df.loc[m,"القيمة"]=df.loc[m,"الكمية"]*df.loc[m,"سعر الوحدة"]
+    m=df["سعر الوحدة"].isna() & df["القيمة"].notna() & df["الكمية"].notna() & (df["الكمية"]!=0)
+    df.loc[m,"سعر الوحدة"]=df.loc[m,"القيمة"]/df.loc[m,"الكمية"]
+    return df.dropna(how="all").reset_index(drop=True)
 
-    needed = ["الصنف", "الكمية", "سعر الوحدة", "الوزن", "القيمة"]
-    for c in needed:
-        if c not in df.columns:
-            df[c] = None
-
-    df = df[needed]
-    df["الصنف"] = df["الصنف"].fillna("").astype(str)
-
-    for c in ["الكمية", "سعر الوحدة", "الوزن", "القيمة"]:
-        df[c] = df[c].apply(clean_number)
-
-    # infer value or unit price
-    mask = df["القيمة"].isna() & df["الكمية"].notna() & df["سعر الوحدة"].notna()
-    df.loc[mask, "القيمة"] = df.loc[mask, "الكمية"] * df.loc[mask, "سعر الوحدة"]
-
-    mask = df["سعر الوحدة"].isna() & df["القيمة"].notna() & df["الكمية"].notna() & (df["الكمية"] != 0)
-    df.loc[mask, "سعر الوحدة"] = df.loc[mask, "القيمة"] / df.loc[mask, "الكمية"]
-
-    # remove clearly empty rows
-    df = df[
-        (df["الصنف"].str.strip() != "") |
-        df["الكمية"].notna() |
-        df["سعر الوحدة"].notna() |
-        df["القيمة"].notna()
-    ].reset_index(drop=True)
-    return df
-
-def read_excel(file):
-    data = file.read()
-    xls = pd.ExcelFile(io.BytesIO(data))
-    best = None
-    for sheet in xls.sheet_names:
-        tmp = pd.read_excel(io.BytesIO(data), sheet_name=sheet)
-        if len(tmp) > 0:
-            best = tmp
-            break
-    return normalize_columns(best if best is not None else pd.DataFrame())
-
-def read_csv(file):
-    data = file.read()
-    for enc in ["utf-8-sig", "utf-8", "latin1"]:
-        try:
-            return normalize_columns(pd.read_csv(io.BytesIO(data), encoding=enc))
-        except:
-            pass
-    return pd.DataFrame()
-
-def read_pdf_tables(file):
-    try:
+def parse_file(f):
+    ext=f.name.lower().rsplit(".",1)[-1]
+    raw=f.getvalue()
+    if ext in ["xlsx","xls"]:
+        # Try each sheet and choose the one with most rows
+        xls=pd.ExcelFile(io.BytesIO(raw))
+        frames=[]
+        for sh in xls.sheet_names:
+            try:
+                d=pd.read_excel(io.BytesIO(raw),sheet_name=sh)
+                if not d.empty: frames.append(d)
+            except: pass
+        if not frames: return pd.DataFrame()
+        return normalize(max(frames,key=len))
+    if ext=="csv":
+        for enc in ["utf-8-sig","utf-8","latin1"]:
+            try:return normalize(pd.read_csv(io.BytesIO(raw),encoding=enc))
+            except: pass
+        return pd.DataFrame()
+    if ext=="pdf":
         import pdfplumber
-        data = file.read()
-        frames = []
-        with pdfplumber.open(io.BytesIO(data)) as pdf:
+        frames=[]
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
             for page in pdf.pages:
-                tables = page.extract_tables()
-                for table in tables:
-                    if not table or len(table) < 2:
-                        continue
-                    headers = table[0]
-                    rows = table[1:]
-                    try:
-                        tmp = pd.DataFrame(rows, columns=headers)
-                        frames.append(tmp)
-                    except:
-                        continue
-        if frames:
-            return normalize_columns(pd.concat(frames, ignore_index=True))
-    except Exception:
-        pass
+                for t in page.extract_tables() or []:
+                    if t and len(t)>1:
+                        try:
+                            h=[str(x or f"col{i}") for i,x in enumerate(t[0])]
+                            frames.append(pd.DataFrame(t[1:],columns=h))
+                        except: pass
+        if frames:return normalize(pd.concat(frames,ignore_index=True))
+        return pd.DataFrame()
     return pd.DataFrame()
 
-def make_pdf(df, transport, method):
-    # English PDF labels to avoid Arabic shaping/font dependency issues.
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4, landscape
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-    from reportlab.lib.styles import getSampleStyleSheet
+uploaded=st.file_uploader("1️⃣ ارفع الفاتورة",type=["xlsx","xls","csv","pdf"])
 
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), rightMargin=20, leftMargin=20, topMargin=20, bottomMargin=20)
-    styles = getSampleStyleSheet()
-    story = [
-        Paragraph("Landed Cost Report", styles["Title"]),
-        Paragraph(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]),
-        Paragraph(f"Freight / Transport: {transport:,.2f}", styles["Normal"]),
-        Paragraph(f"Allocation Method: {method}", styles["Normal"]),
-        Spacer(1, 12)
-    ]
+if uploaded is None:
+    st.info("اضغط Browse files واختر الفاتورة.")
+    st.stop()
 
-    cols = ["الصنف", "الكمية", "سعر الوحدة", "القيمة", "حصة النقل", "النقل/وحدة", "واصل المخزن/وحدة", "الإجمالي واصل"]
-    data = [["Item","Qty","Unit Price","Goods Value","Freight Share","Freight/Unit","Landed/Unit","Landed Total"]]
-    for _, r in df[cols].iterrows():
-        data.append([
-            str(r["الصنف"])[:35],
-            f'{r["الكمية"]:,.2f}' if pd.notna(r["الكمية"]) else "",
-            f'{r["سعر الوحدة"]:,.4f}' if pd.notna(r["سعر الوحدة"]) else "",
-            f'{r["القيمة"]:,.2f}' if pd.notna(r["القيمة"]) else "",
-            f'{r["حصة النقل"]:,.2f}',
-            f'{r["النقل/وحدة"]:,.4f}' if pd.notna(r["النقل/وحدة"]) else "",
-            f'{r["واصل المخزن/وحدة"]:,.4f}' if pd.notna(r["واصل المخزن/وحدة"]) else "",
-            f'{r["الإجمالي واصل"]:,.2f}',
-        ])
+st.success(f"تم رفع الملف: {uploaded.name}")
 
-    table = Table(data, repeatRows=1)
-    table.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,0),colors.lightgrey),
-        ("GRID",(0,0),(-1,-1),0.5,colors.grey),
-        ("FONTSIZE",(0,0),(-1,-1),8),
-        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
-        ("ALIGN",(1,1),(-1,-1),"RIGHT"),
-    ]))
-    story.append(table)
-    doc.build(story)
-    buf.seek(0)
-    return buf.getvalue()
+try:
+    df=parse_file(uploaded)
+except Exception as e:
+    st.warning("لم أستطع قراءة جدول الفاتورة تلقائياً. أدخل البيانات يدوياً بالجدول.")
+    df=pd.DataFrame(columns=["الصنف","الكمية","سعر الوحدة","الوزن","القيمة"])
 
-uploaded = st.file_uploader(
-    "ارفع الفاتورة",
-    type=["xlsx", "xls", "csv", "pdf"],
-    help="أفضل نتيجة حالياً مع Excel/CSV. يدعم PDF إذا كان الجدول داخل الملف قابلاً للقراءة."
+if df.empty:
+    st.warning("لم يتم العثور على أصناف تلقائياً. أضفها يدوياً بالجدول أدناه.")
+    df=pd.DataFrame([{"الصنف":"","الكمية":None,"سعر الوحدة":None,"الوزن":None,"القيمة":None}])
+
+st.subheader("2️⃣ راجع بيانات الفاتورة")
+edited=st.data_editor(
+    df,num_rows="dynamic",use_container_width=True,key="invoice_editor",
+    column_config={
+        "الصنف":st.column_config.TextColumn("الصنف"),
+        "الكمية":st.column_config.NumberColumn("الكمية",min_value=0.0),
+        "سعر الوحدة":st.column_config.NumberColumn("سعر الوحدة",min_value=0.0,format="%.4f"),
+        "الوزن":st.column_config.NumberColumn("الوزن (كغم)",min_value=0.0),
+        "القيمة":st.column_config.NumberColumn("قيمة الصنف",min_value=0.0,format="%.2f"),
+    }
 )
 
-if uploaded:
-    ext = uploaded.name.lower().split(".")[-1]
-    if ext in ["xlsx", "xls"]:
-        df = read_excel(uploaded)
-    elif ext == "csv":
-        df = read_csv(uploaded)
-    elif ext == "pdf":
-        df = read_pdf_tables(uploaded)
-    else:
-        df = pd.DataFrame()
+st.subheader("3️⃣ تكلفة النقل")
+c1,c2=st.columns(2)
+with c1:
+    freight=st.number_input("مبلغ النقل",min_value=0.0,value=0.0,step=100.0)
+with c2:
+    method=st.selectbox("توزيع النقل حسب",["الكمية","الوزن","السعر"])
 
-    if df.empty:
-        st.warning("ما قدرت أستخرج جدول الفاتورة تلقائياً. تقدر تدخل أو تلصق البيانات يدوياً بالجدول أدناه.")
-        df = pd.DataFrame(columns=["الصنف","الكمية","سعر الوحدة","الوزن","القيمة"])
-
-    st.subheader("1) راجع بيانات الفاتورة")
-    st.info("إذا أي عمود مو صحيح، عدّله مباشرة من الجدول قبل الحساب.")
-    df = st.data_editor(
-        df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "الصنف": st.column_config.TextColumn("الصنف"),
-            "الكمية": st.column_config.NumberColumn("الكمية", min_value=0.0, format="%.2f"),
-            "سعر الوحدة": st.column_config.NumberColumn("سعر الوحدة", min_value=0.0, format="%.4f"),
-            "الوزن": st.column_config.NumberColumn("الوزن (كغم)", min_value=0.0, format="%.3f"),
-            "القيمة": st.column_config.NumberColumn("القيمة", min_value=0.0, format="%.2f"),
-        }
-    )
-
-    # recalculate missing values after edits
+if st.button("🧮 احسب السعر واصل المخزن",type="primary"):
+    w=edited.copy()
     for c in ["الكمية","سعر الوحدة","الوزن","القيمة"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    mask = df["القيمة"].isna() & df["الكمية"].notna() & df["سعر الوحدة"].notna()
-    df.loc[mask, "القيمة"] = df.loc[mask, "الكمية"] * df.loc[mask, "سعر الوحدة"]
-    mask = df["سعر الوحدة"].isna() & df["القيمة"].notna() & df["الكمية"].notna() & (df["الكمية"] != 0)
-    df.loc[mask, "سعر الوحدة"] = df.loc[mask, "القيمة"] / df.loc[mask, "الكمية"]
+        w[c]=pd.to_numeric(w[c],errors="coerce")
+    m=w["القيمة"].isna() & w["الكمية"].notna() & w["سعر الوحدة"].notna()
+    w.loc[m,"القيمة"]=w.loc[m,"الكمية"]*w.loc[m,"سعر الوحدة"]
+    m=w["سعر الوحدة"].isna() & w["القيمة"].notna() & w["الكمية"].notna() & (w["الكمية"]!=0)
+    w.loc[m,"سعر الوحدة"]=w.loc[m,"القيمة"]/w.loc[m,"الكمية"]
 
-    st.subheader("2) أدخل تكلفة النقل")
-    c1, c2 = st.columns(2)
-    with c1:
-        transport = st.number_input("تكلفة النقل", min_value=0.0, value=0.0, step=100.0)
-    with c2:
-        method = st.selectbox("توزيع النقل حسب", ["الكمية", "الوزن", "السعر"])
+    if method=="الكمية": base=w["الكمية"].fillna(0)
+    elif method=="الوزن": base=w["الوزن"].fillna(0)
+    else: base=w["القيمة"].fillna(0)
 
-    if st.button("🧮 احسب واصل المخزن", type="primary"):
-        work = df.copy()
-        work = work[work["القيمة"].notna() | work["الكمية"].notna()].reset_index(drop=True)
+    if base.sum()<=0:
+        st.error(f"بيانات {method} ناقصة أو مجموعها صفر.")
+        st.stop()
 
-        if work.empty:
-            st.error("ماكو بيانات كافية للحساب.")
-            st.stop()
+    w["حصة النقل"]=base/base.sum()*freight
+    w["النقل لكل وحدة"]=w.apply(lambda r:r["حصة النقل"]/r["الكمية"] if pd.notna(r["الكمية"]) and r["الكمية"]>0 else None,axis=1)
+    w["سعر الوحدة واصل المخزن"]=w["سعر الوحدة"]+w["النقل لكل وحدة"]
+    w["الإجمالي واصل المخزن"]=w["القيمة"].fillna(0)+w["حصة النقل"]
 
-        if method == "الكمية":
-            base = work["الكمية"].fillna(0)
-            label_method = "Quantity"
-        elif method == "الوزن":
-            base = work["الوزن"].fillna(0)
-            label_method = "Weight"
-        else:
-            base = work["القيمة"].fillna(0)
-            label_method = "Goods Value"
+    st.session_state["result"]=w
+    st.session_state["freight"]=freight
+    st.session_state["method"]=method
 
-        total_base = float(base.sum())
-        if total_base <= 0:
-            st.error(f"ما أقدر أوزع النقل حسب {method} لأن المجموع صفر أو البيانات ناقصة.")
-            st.stop()
+if "result" in st.session_state:
+    w=st.session_state["result"]
+    freight=st.session_state["freight"]
+    method=st.session_state["method"]
+    st.subheader("✅ النتيجة")
+    a,b,c=st.columns(3)
+    goods=w["القيمة"].fillna(0).sum()
+    total=w["الإجمالي واصل المخزن"].sum()
+    a.metric("قيمة البضاعة",f"{goods:,.2f}")
+    b.metric("النقل",f"{freight:,.2f}")
+    c.metric("واصل المخزن",f"{total:,.2f}")
+    st.dataframe(w,use_container_width=True,hide_index=True)
 
-        work["حصة النقل"] = base / total_base * transport
-        work["النقل/وحدة"] = work.apply(
-            lambda r: r["حصة النقل"] / r["الكمية"] if pd.notna(r["الكمية"]) and r["الكمية"] != 0 else None,
-            axis=1
-        )
-        work["واصل المخزن/وحدة"] = work["سعر الوحدة"] + work["النقل/وحدة"]
-        work["الإجمالي واصل"] = work["القيمة"].fillna(0) + work["حصة النقل"]
+    out=io.BytesIO()
+    with pd.ExcelWriter(out,engine="openpyxl") as writer:
+        w.to_excel(writer,index=False,sheet_name="Landed Cost")
+    st.download_button("📊 تحميل النتيجة Excel",out.getvalue(),"landed_cost.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        goods_total = work["القيمة"].fillna(0).sum()
-        landed_total = work["الإجمالي واصل"].sum()
-
-        st.subheader("3) النتيجة")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("قيمة البضاعة", f"{goods_total:,.2f}")
-        m2.metric("النقل", f"{transport:,.2f}")
-        m3.metric("الإجمالي واصل المخزن", f"{landed_total:,.2f}")
-
-        show_cols = ["الصنف","الكمية","سعر الوحدة","الوزن","القيمة","حصة النقل","النقل/وحدة","واصل المخزن/وحدة","الإجمالي واصل"]
-        st.dataframe(work[show_cols], use_container_width=True, hide_index=True)
-
-        # Excel
-        excel_buf = io.BytesIO()
-        with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-            work[show_cols].to_excel(writer, index=False, sheet_name="Landed Cost")
-        excel_buf.seek(0)
-
-        # PDF
-        pdf_bytes = make_pdf(work, transport, label_method)
-
-        d1, d2 = st.columns(2)
-        with d1:
-            st.download_button(
-                "📄 تحميل PDF",
-                data=pdf_bytes,
-                file_name="landed_cost.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
-        with d2:
-            st.download_button(
-                "📊 تحميل Excel",
-                data=excel_buf.getvalue(),
-                file_name="landed_cost.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
-
-        summary = (
-            f"نتيجة حساب واصل المخزن\n"
-            f"قيمة البضاعة: {goods_total:,.2f}\n"
-            f"النقل: {transport:,.2f}\n"
-            f"طريقة التوزيع: {method}\n"
-            f"الإجمالي واصل المخزن: {landed_total:,.2f}"
-        )
-        wa = "https://wa.me/?text=" + urllib.parse.quote(summary)
-        st.link_button("🟢 مشاركة ملخص على واتساب", wa, use_container_width=True)
-
-        st.caption("ملاحظة: المتصفح لا يسمح بإرفاق ملف PDF تلقائياً داخل واتساب. نزّل الـPDF ثم أرسله من واتساب، أو استخدم زر مشاركة الملخص.")
-else:
-    st.info("ابدأ برفع فاتورة Excel / CSV / PDF.")
+    msg=f"""حساب واصل المخزن
+قيمة البضاعة: {goods:,.2f}
+النقل: {freight:,.2f}
+التوزيع حسب: {method}
+الإجمالي واصل المخزن: {total:,.2f}"""
+    st.link_button("🟢 مشاركة الملخص على WhatsApp","https://wa.me/?text="+urllib.parse.quote(msg))
